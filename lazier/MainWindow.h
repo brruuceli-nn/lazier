@@ -37,6 +37,7 @@ private slots:
     void resetWebZoom();
     void setAddressBarVisible(bool visible);
     void updateHistoryButtons();
+    void openLocalText(const QString &pathText);
 
 private:
     enum { BorderWidth = 6 };

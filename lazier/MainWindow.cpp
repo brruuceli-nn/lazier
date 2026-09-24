@@ -4,6 +4,9 @@
 #include "TitleBar.h"
 
 #include <QtCore/QEvent>
+#include <QtCore/QFile>
+#include <QtCore/QFileInfo>
+#include <QtCore/QTextCodec>
 #include <QtCore/QTimer>
 #include <QtCore/QUrl>
 #include <QtGui/QColor>
@@ -17,6 +20,7 @@
 #include <QtWebEngineWidgets/QWebEngineHistory>
 #include <QtWebEngineWidgets/QWebEngineView>
 #include <QtWidgets/QApplication>
+#include <QtWidgets/QComboBox>
 #include <QtWidgets/QHBoxLayout>
 #include <QtWidgets/QLineEdit>
 #include <QtWidgets/QMenu>
@@ -32,6 +36,30 @@
 
 namespace {
 const qreal kGhostOpacity = 0.0;
+
+QString pageHtml(const QString &body)
+{
+    return QStringLiteral(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+        "<style>body{margin:16px;background:#ffffff;color:#222222;"
+        "font-family:'Microsoft YaHei',sans-serif;font-size:16px;line-height:1.7;"
+        "white-space:pre-wrap;word-wrap:break-word;}</style></head><body>%1</body></html>")
+        .arg(body.toHtmlEscaped());
+}
+
+QString decodeTextFile(const QByteArray &bytes)
+{
+    if (QTextCodec *bom = QTextCodec::codecForUtfText(bytes, nullptr))
+        return bom->toUnicode(bytes);
+    QTextCodec::ConverterState state;
+    QTextCodec *utf8 = QTextCodec::codecForName("UTF-8");
+    const QString utf = utf8->toUnicode(bytes.constData(), bytes.size(), &state);
+    if (state.invalidChars == 0)
+        return utf;
+    if (QTextCodec *gbk = QTextCodec::codecForName("GB18030"))
+        return gbk->toUnicode(bytes);
+    return QString::fromLocal8Bit(bytes);
+}
 
 #ifdef Q_OS_WIN
 MainWindow *g_mainWindow = nullptr;
@@ -131,7 +159,8 @@ MainWindow::MainWindow(QWidget *parent)
         "QPushButton#navButton { background: transparent; border: none; color: #333333; font-size: 14px; }"
         "QPushButton#navButton:hover { background: #E5E5E5; }"
         "QPushButton#navButton:pressed { background: #D5D5D5; }"
-        "QPushButton#navButton:disabled { color: #BBBBBB; }"));
+        "QPushButton#navButton:disabled { color: #BBBBBB; }"
+        "QComboBox#sourceCombo { background: #FFFFFF; border: 1px solid #D0D0D0; padding: 1px 6px 1px 4px; }"));
     m_backButton = new QPushButton(QStringLiteral("<"), m_addressBar);
     m_backButton->setObjectName(QStringLiteral("navButton"));
     m_backButton->setFixedSize(26, 26);
@@ -142,6 +171,12 @@ MainWindow::MainWindow(QWidget *parent)
     m_forwardButton->setFixedSize(26, 26);
     m_forwardButton->setToolTip(QStringLiteral("前进"));
     m_forwardButton->setEnabled(false);
+    QComboBox *sourceCombo = new QComboBox(m_addressBar);
+    sourceCombo->setObjectName(QStringLiteral("sourceCombo"));
+    sourceCombo->addItem(QStringLiteral("网络"));
+    sourceCombo->addItem(QStringLiteral("本地"));
+    sourceCombo->setFixedWidth(72);
+    sourceCombo->setToolTip(QStringLiteral("网络打开网址，本地打开 txt 文件"));
     QLineEdit *urlEdit = new QLineEdit(m_addressBar);
     urlEdit->setPlaceholderText(QStringLiteral("输入网址后回车"));
     QPushButton *goButton = new QPushButton(QStringLiteral("前往"), m_addressBar);
@@ -150,13 +185,18 @@ MainWindow::MainWindow(QWidget *parent)
     addressLayout->setSpacing(2);
     addressLayout->addWidget(m_backButton);
     addressLayout->addWidget(m_forwardButton);
+    addressLayout->addWidget(sourceCombo);
     addressLayout->addWidget(urlEdit, 1);
     addressLayout->addWidget(goButton);
 
     m_web = new QWebEngineView(m_frame);
     m_web->setUrl(QUrl(QStringLiteral("about:blank")));
 
-    const auto navigate = [this, urlEdit]() {
+    const auto navigate = [this, urlEdit, sourceCombo]() {
+        if (sourceCombo->currentIndex() == 1) {
+            openLocalText(urlEdit->text());
+            return;
+        }
         QString text = urlEdit->text().trimmed();
         if (text.isEmpty()) {
             m_web->setUrl(QUrl(QStringLiteral("about:blank")));
@@ -168,10 +208,16 @@ MainWindow::MainWindow(QWidget *parent)
     };
     connect(urlEdit, &QLineEdit::returnPressed, this, navigate);
     connect(goButton, &QPushButton::clicked, this, navigate);
+    connect(sourceCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [urlEdit](int index) {
+        urlEdit->setPlaceholderText(index == 1
+            ? QStringLiteral("输入本地 txt 路径后回车")
+            : QStringLiteral("输入网址后回车"));
+    });
     connect(m_backButton, &QPushButton::clicked, m_web, &QWebEngineView::back);
     connect(m_forwardButton, &QPushButton::clicked, m_web, &QWebEngineView::forward);
-    connect(m_web, &QWebEngineView::urlChanged, this, [this, urlEdit](const QUrl &url) {
-        urlEdit->setText(url.toString());
+    connect(m_web, &QWebEngineView::urlChanged, this, [this, urlEdit, sourceCombo](const QUrl &url) {
+        if (sourceCombo->currentIndex() == 0)
+            urlEdit->setText(url.toString());
         updateHistoryButtons();
     });
     connect(m_web, &QWebEngineView::loadFinished, this, [this](bool) {
@@ -465,6 +511,37 @@ void MainWindow::updateHistoryButtons()
         m_backButton->setEnabled(history && history->canGoBack());
     if (m_forwardButton)
         m_forwardButton->setEnabled(history && history->canGoForward());
+}
+
+void MainWindow::openLocalText(const QString &pathText)
+{
+    QString path = pathText.trimmed();
+    if (path.size() >= 2 && path.startsWith(QLatin1Char('"')) && path.endsWith(QLatin1Char('"')))
+        path = path.mid(1, path.size() - 2).trimmed();
+    if (path.startsWith(QStringLiteral("file:"), Qt::CaseInsensitive))
+        path = QUrl(path).toLocalFile();
+    if (path.isEmpty()) {
+        m_web->setHtml(pageHtml(QStringLiteral("请输入 txt 文件路径")));
+        return;
+    }
+
+    const QFileInfo info(path);
+    if (!info.exists() || !info.isFile()) {
+        m_web->setHtml(pageHtml(QStringLiteral("找不到文件：%1").arg(path)));
+        return;
+    }
+    if (info.suffix().compare(QLatin1String("txt"), Qt::CaseInsensitive) != 0) {
+        m_web->setHtml(pageHtml(QStringLiteral("本地模式只打开 txt 文件")));
+        return;
+    }
+
+    QFile file(info.absoluteFilePath());
+    if (!file.open(QIODevice::ReadOnly)) {
+        m_web->setHtml(pageHtml(QStringLiteral("无法打开文件：%1").arg(info.absoluteFilePath())));
+        return;
+    }
+    m_web->setHtml(pageHtml(decodeTextFile(file.readAll())),
+                   QUrl::fromLocalFile(info.absolutePath() + QLatin1Char('/')));
 }
 
 void MainWindow::hideFromTaskbar()

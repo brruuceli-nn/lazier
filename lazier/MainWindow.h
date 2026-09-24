@@ -28,7 +28,7 @@ protected:
 
 private slots:
     void setStayOnTop(bool on);
-    void setGhostMode(bool on);
+    void setGhostSettings(bool enabled, bool enhanced, int modifiers, int virtualKey);
     void setDisplayOpacity(int percent);
     void updateGhostVisual();
     void minimizeForSwitcher();
@@ -57,5 +57,11 @@ private:
     QTimer *m_ghostTimer = nullptr;
     QSystemTrayIcon *m_tray = nullptr;
     bool m_ghostMode = false;
+    bool m_ghostArmed = false;
+    bool m_ghostWatchingEnter = false;
+    bool m_ghostCursorWasInside = false;
+    bool m_ghostEnhanced = false;
+    int m_ghostModifiers = 0;
+    int m_ghostVirtualKey = 0;
     int m_displayOpacity = 100;
 };

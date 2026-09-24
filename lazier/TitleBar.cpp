@@ -2,20 +2,136 @@
 
 #include "Icons.h"
 
+#include <QtCore/QEvent>
+#include <QtCore/QSettings>
+#include <QtCore/QStringList>
+#include <QtCore/QTimer>
 #include <QtGui/QMouseEvent>
 #include <QtGui/QPainter>
 #include <QtGui/QPixmap>
 #include <QtGui/QWheelEvent>
+#include <QtWidgets/QButtonGroup>
 #include <QtWidgets/QHBoxLayout>
 #include <QtWidgets/QLabel>
+#include <QtWidgets/QPushButton>
+#include <QtWidgets/QRadioButton>
 #include <QtWidgets/QSlider>
+#include <QtWidgets/QVBoxLayout>
 #include <QtWidgets/QWidget>
+
+#ifdef Q_OS_WIN
+#include <windows.h>
+#endif
 
 namespace {
 const int kHeight = 30;
 const int kButtonWidth = 28;
 const int kIcon = 8;
 const int kButtonRightPad = 6;
+
+QString virtualKeyText(int virtualKey)
+{
+#ifdef Q_OS_WIN
+    if (virtualKey <= 0)
+        return QString();
+    const UINT scan = MapVirtualKeyW(UINT(virtualKey), MAPVK_VK_TO_VSC);
+    LONG param = LONG(scan) << 16;
+    switch (virtualKey) {
+    case VK_LEFT: case VK_RIGHT: case VK_UP: case VK_DOWN:
+    case VK_PRIOR: case VK_NEXT: case VK_END: case VK_HOME:
+    case VK_INSERT: case VK_DELETE: case VK_DIVIDE: case VK_NUMLOCK:
+        param |= 1 << 24;
+        break;
+    default:
+        break;
+    }
+    wchar_t name[64] = {};
+    if (GetKeyNameTextW(param, name, 64) > 0)
+        return QString::fromWCharArray(name);
+#else
+    Q_UNUSED(virtualKey)
+#endif
+    return QString();
+}
+
+QString ghostHotkeyText(int modifiers, int virtualKey)
+{
+    QStringList parts;
+    if (modifiers & Qt::ControlModifier)
+        parts << QStringLiteral("Ctrl");
+    if (modifiers & Qt::ShiftModifier)
+        parts << QStringLiteral("Shift");
+    if (modifiers & Qt::AltModifier)
+        parts << QStringLiteral("Alt");
+    if (modifiers & Qt::MetaModifier)
+        parts << QStringLiteral("Win");
+    const QString key = virtualKeyText(virtualKey);
+    if (!key.isEmpty())
+        parts << key;
+    return parts.join(QStringLiteral("+"));
+}
+
+#ifdef Q_OS_WIN
+bool isKeyDown(int virtualKey)
+{
+    return (GetAsyncKeyState(virtualKey) & 0x8000) != 0;
+}
+
+bool isIgnoredRecordKey(int virtualKey)
+{
+    switch (virtualKey) {
+    case VK_LBUTTON: case VK_RBUTTON: case VK_MBUTTON:
+    case VK_XBUTTON1: case VK_XBUTTON2:
+    case VK_SHIFT: case VK_LSHIFT: case VK_RSHIFT:
+    case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL:
+    case VK_MENU: case VK_LMENU: case VK_RMENU:
+    case VK_LWIN: case VK_RWIN:
+    case VK_ESCAPE:
+        return true;
+    default:
+        return false;
+    }
+}
+
+int findRecordedVirtualKey()
+{
+    for (int virtualKey = 1; virtualKey < 256; ++virtualKey) {
+        if (isIgnoredRecordKey(virtualKey))
+            continue;
+        if (isKeyDown(virtualKey))
+            return virtualKey;
+    }
+    return 0;
+}
+
+int recordedModifierMask()
+{
+    int modifiers = 0;
+    if (isKeyDown(VK_CONTROL))
+        modifiers |= Qt::ControlModifier;
+    if (isKeyDown(VK_SHIFT))
+        modifiers |= Qt::ShiftModifier;
+    if (isKeyDown(VK_MENU))
+        modifiers |= Qt::AltModifier;
+    if (isKeyDown(VK_LWIN) || isKeyDown(VK_RWIN))
+        modifiers |= Qt::MetaModifier;
+    return modifiers;
+}
+
+int modifierCount(int modifiers, int virtualKey)
+{
+    int count = virtualKey != 0 ? 1 : 0;
+    if (modifiers & Qt::ControlModifier)
+        ++count;
+    if (modifiers & Qt::ShiftModifier)
+        ++count;
+    if (modifiers & Qt::AltModifier)
+        ++count;
+    if (modifiers & Qt::MetaModifier)
+        ++count;
+    return count;
+}
+#endif
 }
 
 const TitleBar::Button TitleBar::kButtonOrder[TitleBar::kButtonCount] = {
@@ -38,6 +154,7 @@ TitleBar::TitleBar(QWidget *parent)
     m_pinIcon.load(QStringLiteral(":/lazier/image/fix.png"));
     m_ghostIcon.load(QStringLiteral(":/lazier/image/transparent.png"));
     m_opacityIcon.load(QStringLiteral(":/lazier/image/percent.png"));
+    loadGhostSettings();
 }
 
 QSize TitleBar::sizeHint() const
@@ -52,7 +169,22 @@ bool TitleBar::stayOnTop() const
 
 bool TitleBar::ghostMode() const
 {
-    return m_ghostMode;
+    return m_ghostOption != 0;
+}
+
+bool TitleBar::ghostEnhanced() const
+{
+    return m_ghostOption == 2;
+}
+
+int TitleBar::ghostModifiers() const
+{
+    return m_ghostModifiers;
+}
+
+int TitleBar::ghostVirtualKey() const
+{
+    return m_ghostVirtualKey;
 }
 
 int TitleBar::displayOpacity() const
@@ -71,9 +203,10 @@ void TitleBar::resetToDefaults()
         m_stayOnTop = false;
         emit stayOnTopChanged(false);
     }
-    if (m_ghostMode) {
-        m_ghostMode = false;
-        emit ghostModeChanged(false);
+    if (m_ghostOption != 0) {
+        m_ghostOption = 0;
+        saveGhostSettings();
+        emitGhostSettings();
     }
     setDisplayOpacity(100);
     if (!m_addressBarVisible) {
@@ -114,8 +247,17 @@ void TitleBar::updateTooltip(Button button)
 {
     if (button == Pin)
         setToolTip(QStringLiteral("置顶"));
-    else if (button == Ghost)
-        setToolTip(QStringLiteral("离开窗口后透明"));
+    else if (button == Ghost) {
+        const QString hotkey = ghostHotkeyText(m_ghostModifiers, m_ghostVirtualKey);
+        if (m_ghostOption == 2 && !hotkey.isEmpty())
+            setToolTip(QStringLiteral("按住 %1，鼠标在窗口上才显示").arg(hotkey));
+        else if (m_ghostOption == 2)
+            setToolTip(QStringLiteral("增强：请先录入按键，未设置时仍按鼠标显示"));
+        else if (m_ghostOption == 1)
+            setToolTip(QStringLiteral("鼠标在窗口上才显示"));
+        else
+            setToolTip(QStringLiteral("透明设置"));
+    }
     else if (button == Opacity)
         setToolTip(QStringLiteral("正常显示透明度: %1").arg(m_displayOpacity));
     else if (button == ToggleAddress)
@@ -127,7 +269,7 @@ void TitleBar::updateTooltip(Button button)
 bool TitleBar::isToggled(Button button) const
 {
     return (button == Pin && m_stayOnTop)
-        || (button == Ghost && m_ghostMode)
+        || (button == Ghost && m_ghostOption != 0)
         || (button == Opacity && m_displayOpacity < 100)
         || (button == ToggleAddress && !m_addressBarVisible);
 }
@@ -318,9 +460,7 @@ void TitleBar::mouseReleaseEvent(QMouseEvent *event)
         update();
         emit stayOnTopChanged(m_stayOnTop);
     } else if (released == Ghost) {
-        m_ghostMode = !m_ghostMode;
-        update();
-        emit ghostModeChanged(m_ghostMode);
+        showGhostPopup();
     } else if (released == Opacity) {
         showOpacityPopup();
     } else if (released == ToggleAddress) {
@@ -401,4 +541,202 @@ void TitleBar::showOpacityPopup()
     QPoint pos = mapToGlobal(QPoint(rc.right() - m_opacityPopup->width(), rc.bottom()));
     m_opacityPopup->move(pos);
     m_opacityPopup->show();
+}
+
+bool TitleBar::eventFilter(QObject *watched, QEvent *event)
+{
+    if (watched == m_ghostPopup && event->type() == QEvent::Hide)
+        stopGhostRecord(false);
+    return QWidget::eventFilter(watched, event);
+}
+
+void TitleBar::showGhostPopup()
+{
+    if (!m_ghostPopup)
+        createGhostPopup();
+
+    m_ghostGroup->blockSignals(true);
+    if (QAbstractButton *button = m_ghostGroup->button(m_ghostOption))
+        button->setChecked(true);
+    m_ghostGroup->blockSignals(false);
+    m_ghostRecordButton->setEnabled(m_ghostOption == 2);
+    updateGhostKeyLabel();
+
+    const QRect rc = buttonRect(Ghost);
+    QPoint pos = mapToGlobal(QPoint(rc.right() - m_ghostPopup->width(), rc.bottom()));
+    if (pos.x() < 0)
+        pos.setX(0);
+    m_ghostPopup->move(pos);
+    m_ghostPopup->show();
+}
+
+void TitleBar::createGhostPopup()
+{
+    m_ghostPopup = new QWidget(window(), Qt::Popup | Qt::FramelessWindowHint);
+    m_ghostPopup->setFixedSize(268, 112);
+    m_ghostPopup->setStyleSheet(QStringLiteral(
+        "QWidget { background: #FFFFFF; border: 1px solid #D0D0D0; }"
+        "QRadioButton, QLabel, QPushButton { border: none; color: #222222; background: transparent; }"
+        "QPushButton#recordButton { background: #F3F3F3; padding: 2px 8px; }"
+        "QPushButton#recordButton:disabled { color: #AAAAAA; background: #F7F7F7; }"));
+    m_ghostPopup->installEventFilter(this);
+
+    m_ghostOff = new QRadioButton(QStringLiteral("关闭"), m_ghostPopup);
+    m_ghostMouse = new QRadioButton(QStringLiteral("鼠标（默认）"), m_ghostPopup);
+    m_ghostEnhancedButton = new QRadioButton(QStringLiteral("增强"), m_ghostPopup);
+    m_ghostMouse->setToolTip(QStringLiteral("鼠标在窗口上才显示，离开后透明"));
+    m_ghostEnhancedButton->setToolTip(QStringLiteral("按住录入的键，并且鼠标在窗口上才显示"));
+
+    m_ghostGroup = new QButtonGroup(m_ghostPopup);
+    m_ghostGroup->addButton(m_ghostOff, 0);
+    m_ghostGroup->addButton(m_ghostMouse, 1);
+    m_ghostGroup->addButton(m_ghostEnhancedButton, 2);
+
+    m_ghostKeyLabel = new QLabel(m_ghostPopup);
+    m_ghostKeyLabel->setAlignment(Qt::AlignVCenter | Qt::AlignLeft);
+    m_ghostRecordButton = new QPushButton(QStringLiteral("录入"), m_ghostPopup);
+    m_ghostRecordButton->setObjectName(QStringLiteral("recordButton"));
+    m_ghostRecordButton->setFixedWidth(52);
+    m_ghostRecordButton->setEnabled(false);
+
+    QVBoxLayout *layout = new QVBoxLayout(m_ghostPopup);
+    layout->setContentsMargins(10, 8, 10, 8);
+    layout->setSpacing(4);
+    layout->addWidget(m_ghostOff);
+    layout->addWidget(m_ghostMouse);
+    QHBoxLayout *enhancedRow = new QHBoxLayout;
+    enhancedRow->setContentsMargins(0, 0, 0, 0);
+    enhancedRow->setSpacing(6);
+    enhancedRow->addWidget(m_ghostEnhancedButton);
+    enhancedRow->addWidget(m_ghostKeyLabel, 1);
+    enhancedRow->addWidget(m_ghostRecordButton);
+    layout->addLayout(enhancedRow);
+
+    connect(m_ghostGroup, QOverload<int>::of(&QButtonGroup::buttonClicked),
+            this, &TitleBar::onGhostOption);
+    connect(m_ghostRecordButton, &QPushButton::clicked, this, &TitleBar::toggleGhostRecord);
+
+    m_ghostRecordTimer = new QTimer(this);
+    m_ghostRecordTimer->setInterval(30);
+    connect(m_ghostRecordTimer, &QTimer::timeout, this, &TitleBar::pollGhostRecord);
+}
+
+void TitleBar::onGhostOption(int id)
+{
+    if (id != 2)
+        stopGhostRecord(false);
+    m_ghostOption = id;
+    if (m_ghostRecordButton)
+        m_ghostRecordButton->setEnabled(id == 2);
+    saveGhostSettings();
+    updateGhostKeyLabel();
+    emitGhostSettings();
+}
+
+void TitleBar::toggleGhostRecord()
+{
+    if (m_recording) {
+        stopGhostRecord(false);
+        return;
+    }
+    if (m_ghostOption != 2)
+        onGhostOption(2);
+    m_recording = true;
+    m_recordSeen = false;
+    m_recordCount = 0;
+    m_recordMods = 0;
+    m_recordVk = 0;
+    if (m_ghostRecordButton)
+        m_ghostRecordButton->setText(QStringLiteral("取消"));
+    if (m_ghostKeyLabel)
+        m_ghostKeyLabel->setText(QStringLiteral("请按键"));
+    if (m_ghostRecordTimer)
+        m_ghostRecordTimer->start();
+}
+
+void TitleBar::pollGhostRecord()
+{
+#ifndef Q_OS_WIN
+    stopGhostRecord(false);
+#else
+    if (isKeyDown(VK_ESCAPE)) {
+        stopGhostRecord(false);
+        return;
+    }
+    const int modifiers = recordedModifierMask();
+    const int virtualKey = findRecordedVirtualKey();
+    const int count = modifierCount(modifiers, virtualKey);
+    if (count > 0 && count >= m_recordCount) {
+        m_recordSeen = true;
+        m_recordCount = count;
+        m_recordMods = modifiers;
+        m_recordVk = virtualKey;
+        if (m_ghostKeyLabel)
+            m_ghostKeyLabel->setText(ghostHotkeyText(modifiers, virtualKey));
+        return;
+    }
+    if (m_recordSeen && count == 0)
+        stopGhostRecord(true);
+#endif
+}
+
+void TitleBar::stopGhostRecord(bool commit)
+{
+    if (!m_recording)
+        return;
+    m_recording = false;
+    if (m_ghostRecordTimer)
+        m_ghostRecordTimer->stop();
+    if (m_ghostRecordButton)
+        m_ghostRecordButton->setText(QStringLiteral("录入"));
+    const bool changed = commit && m_recordSeen && m_recordCount > 0;
+    if (changed) {
+        m_ghostModifiers = m_recordMods;
+        m_ghostVirtualKey = m_recordVk;
+        saveGhostSettings();
+    }
+    m_recordSeen = false;
+    m_recordCount = 0;
+    updateGhostKeyLabel();
+    if (changed)
+        emitGhostSettings();
+}
+
+void TitleBar::loadGhostSettings()
+{
+    QSettings settings;
+    m_ghostOption = settings.value(QStringLiteral("ghost/mode"), 0).toInt();
+    if (m_ghostOption < 0 || m_ghostOption > 2)
+        m_ghostOption = 0;
+    m_ghostModifiers = settings.value(QStringLiteral("ghost/modifiers"), 0).toInt();
+    m_ghostVirtualKey = settings.value(QStringLiteral("ghost/virtualKey"), 0).toInt();
+}
+
+void TitleBar::saveGhostSettings() const
+{
+    QSettings settings;
+    settings.setValue(QStringLiteral("ghost/mode"), m_ghostOption);
+    settings.setValue(QStringLiteral("ghost/modifiers"), m_ghostModifiers);
+    settings.setValue(QStringLiteral("ghost/virtualKey"), m_ghostVirtualKey);
+}
+
+void TitleBar::emitGhostSettings()
+{
+    emit ghostSettingsChanged(m_ghostOption != 0, m_ghostOption == 2, m_ghostModifiers, m_ghostVirtualKey);
+    updateGhostTooltip();
+    update();
+}
+
+void TitleBar::updateGhostKeyLabel()
+{
+    if (!m_ghostKeyLabel || m_recording)
+        return;
+    const QString text = ghostHotkeyText(m_ghostModifiers, m_ghostVirtualKey);
+    m_ghostKeyLabel->setText(text.isEmpty() ? QStringLiteral("未设置") : text);
+}
+
+void TitleBar::updateGhostTooltip()
+{
+    if (m_hover == Ghost)
+        updateTooltip(Ghost);
 }

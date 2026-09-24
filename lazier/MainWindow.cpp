@@ -82,6 +82,26 @@ LRESULT CALLBACK mouseProc(int nCode, WPARAM wParam, LPARAM lParam)
     }
     return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
 }
+
+bool isVirtualKeyDown(int virtualKey)
+{
+    return (GetAsyncKeyState(virtualKey) & 0x8000) != 0;
+}
+
+bool ghostHotkeyHeld(int modifiers, int virtualKey)
+{
+    if ((modifiers & Qt::ControlModifier) && !isVirtualKeyDown(VK_CONTROL))
+        return false;
+    if ((modifiers & Qt::ShiftModifier) && !isVirtualKeyDown(VK_SHIFT))
+        return false;
+    if ((modifiers & Qt::AltModifier) && !isVirtualKeyDown(VK_MENU))
+        return false;
+    if ((modifiers & Qt::MetaModifier) && !isVirtualKeyDown(VK_LWIN) && !isVirtualKeyDown(VK_RWIN))
+        return false;
+    if (virtualKey != 0 && !isVirtualKeyDown(virtualKey))
+        return false;
+    return modifiers != 0 || virtualKey != 0;
+}
 #endif
 }
 
@@ -99,7 +119,7 @@ MainWindow::MainWindow(QWidget *parent)
 
     m_titleBar = new TitleBar(m_frame);
     connect(m_titleBar, &TitleBar::stayOnTopChanged, this, &MainWindow::setStayOnTop);
-    connect(m_titleBar, &TitleBar::ghostModeChanged, this, &MainWindow::setGhostMode);
+    connect(m_titleBar, &TitleBar::ghostSettingsChanged, this, &MainWindow::setGhostSettings);
     connect(m_titleBar, &TitleBar::displayOpacityChanged, this, &MainWindow::setDisplayOpacity);
     connect(m_titleBar, &TitleBar::addressBarVisibleChanged, this, &MainWindow::setAddressBarVisible);
 
@@ -169,6 +189,8 @@ MainWindow::MainWindow(QWidget *parent)
     m_ghostTimer = new QTimer(this);
     m_ghostTimer->setInterval(50);
     connect(m_ghostTimer, &QTimer::timeout, this, &MainWindow::updateGhostVisual);
+    setGhostSettings(m_titleBar->ghostMode(), m_titleBar->ghostEnhanced(),
+                     m_titleBar->ghostModifiers(), m_titleBar->ghostVirtualKey());
 
     m_tray = new QSystemTrayIcon(lazierTrayIcon(), this);
     m_tray->setToolTip(QStringLiteral("lazier"));
@@ -278,13 +300,22 @@ void MainWindow::setStayOnTop(bool on)
     updateGhostVisual();
 }
 
-void MainWindow::setGhostMode(bool on)
+void MainWindow::setGhostSettings(bool enabled, bool enhanced, int modifiers, int virtualKey)
 {
-    m_ghostMode = on;
-    if (m_ghostMode)
-        m_ghostTimer->start();
-    else
+    const bool wasEnabled = m_ghostMode;
+    m_ghostMode = enabled;
+    m_ghostEnhanced = enhanced;
+    m_ghostModifiers = modifiers;
+    m_ghostVirtualKey = virtualKey;
+    if (!m_ghostMode) {
+        m_ghostArmed = false;
+        m_ghostWatchingEnter = false;
         m_ghostTimer->stop();
+    } else {
+        if (!wasEnabled && isVisible())
+            m_ghostArmed = true;
+        m_ghostTimer->start();
+    }
     updateGhostVisual();
 }
 
@@ -296,7 +327,35 @@ void MainWindow::setDisplayOpacity(int percent)
 
 void MainWindow::updateGhostVisual()
 {
-    if (m_ghostMode && !isCursorInside()) {
+    const bool inside = isCursorInside();
+    const bool hotkeyMode = m_ghostEnhanced && (m_ghostModifiers != 0 || m_ghostVirtualKey != 0);
+    if (m_ghostMode && !m_ghostArmed && isVisible()) {
+        if (!m_ghostWatchingEnter) {
+            m_ghostCursorWasInside = inside;
+            m_ghostWatchingEnter = true;
+        } else if (hotkeyMode) {
+#ifdef Q_OS_WIN
+            if (inside && ghostHotkeyHeld(m_ghostModifiers, m_ghostVirtualKey))
+                m_ghostArmed = true;
+#endif
+        } else if (inside && !m_ghostCursorWasInside) {
+            m_ghostArmed = true;
+        }
+    }
+    m_ghostCursorWasInside = inside;
+
+    bool show = true;
+    if (m_ghostMode && m_ghostArmed) {
+        show = inside;
+        if (show && hotkeyMode) {
+#ifdef Q_OS_WIN
+            show = ghostHotkeyHeld(m_ghostModifiers, m_ghostVirtualKey);
+#else
+            show = true;
+#endif
+        }
+    }
+    if (!show) {
         setWindowOpacity(kGhostOpacity);
         return;
     }

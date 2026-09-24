@@ -302,14 +302,20 @@ void MainWindow::setStayOnTop(bool on)
 
 void MainWindow::setGhostSettings(bool enabled, bool enhanced, int modifiers, int virtualKey)
 {
+    const bool wasEnabled = m_ghostMode;
     m_ghostMode = enabled;
     m_ghostEnhanced = enhanced;
     m_ghostModifiers = modifiers;
     m_ghostVirtualKey = virtualKey;
-    if (m_ghostMode)
-        m_ghostTimer->start();
-    else
+    if (!m_ghostMode) {
+        m_ghostArmed = false;
+        m_ghostWatchingEnter = false;
         m_ghostTimer->stop();
+    } else {
+        if (!wasEnabled && isVisible())
+            m_ghostArmed = true;
+        m_ghostTimer->start();
+    }
     updateGhostVisual();
 }
 
@@ -321,10 +327,27 @@ void MainWindow::setDisplayOpacity(int percent)
 
 void MainWindow::updateGhostVisual()
 {
+    const bool inside = isCursorInside();
+    const bool hotkeyMode = m_ghostEnhanced && (m_ghostModifiers != 0 || m_ghostVirtualKey != 0);
+    if (m_ghostMode && !m_ghostArmed && isVisible()) {
+        if (!m_ghostWatchingEnter) {
+            m_ghostCursorWasInside = inside;
+            m_ghostWatchingEnter = true;
+        } else if (hotkeyMode) {
+#ifdef Q_OS_WIN
+            if (inside && ghostHotkeyHeld(m_ghostModifiers, m_ghostVirtualKey))
+                m_ghostArmed = true;
+#endif
+        } else if (inside && !m_ghostCursorWasInside) {
+            m_ghostArmed = true;
+        }
+    }
+    m_ghostCursorWasInside = inside;
+
     bool show = true;
-    if (m_ghostMode) {
-        show = isCursorInside();
-        if (show && m_ghostEnhanced && (m_ghostModifiers != 0 || m_ghostVirtualKey != 0)) {
+    if (m_ghostMode && m_ghostArmed) {
+        show = inside;
+        if (show && hotkeyMode) {
 #ifdef Q_OS_WIN
             show = ghostHotkeyHeld(m_ghostModifiers, m_ghostVirtualKey);
 #else

@@ -3,6 +3,8 @@
 #include <QtCore/Qt>
 #include <QtWidgets/QMainWindow>
 
+class QComboBox;
+class QLineEdit;
 class QPushButton;
 class QSystemTrayIcon;
 class QTimer;
@@ -37,7 +39,10 @@ private slots:
     void resetWebZoom();
     void setAddressBarVisible(bool visible);
     void updateHistoryButtons();
-    void openLocalText(const QString &pathText);
+    void openLocalText(const QString &pathText, int line = 1);
+    void showBookmarkPopup();
+    void saveBookmark(int index);
+    void openBookmark(int index);
 
 private:
     enum { BorderWidth = 6 };
@@ -48,13 +53,32 @@ private:
     void hideFromTaskbar();
     void installSwitcherHook();
     void removeSwitcherHook();
+    void loadBookmarks();
+    void saveBookmarks();
+    void refreshBookmarkPopup();
+    QString bookmarkLabel(int index) const;
+    void createBookmarkPopup();
+
+    struct ReadingBookmark {
+        int kind = 0;
+        QString target;
+        int position = 0;
+    };
 
     TitleBar *m_titleBar = nullptr;
     QWebEngineView *m_web = nullptr;
     QWidget *m_frame = nullptr;
     QWidget *m_addressBar = nullptr;
+    QComboBox *m_sourceCombo = nullptr;
+    QLineEdit *m_urlEdit = nullptr;
     QPushButton *m_backButton = nullptr;
     QPushButton *m_forwardButton = nullptr;
+    QWidget *m_bookmarkPopup = nullptr;
+    QPushButton *m_bookmarkButtons[10] = {};
+    ReadingBookmark m_bookmarks[10];
+    QString m_currentLocalPath;
+    int m_pendingLocalLine = 0;
+    int m_pendingWebScroll = -1;
     QTimer *m_ghostTimer = nullptr;
     QSystemTrayIcon *m_tray = nullptr;
     bool m_ghostMode = false;
